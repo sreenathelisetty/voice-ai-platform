@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Voice AI Platform — Test UI</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f0f0f;
+      color: #e0e0e0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 40px 20px;
+    }
+    h1 { font-size: 1.4rem; font-weight: 600; margin-bottom: 8px; color: #fff; }
+    .subtitle { font-size: 0.85rem; color: #666; margin-bottom: 24px; }
+
+    #status {
+      font-size: 0.8rem;
+      padding: 4px 14px;
+      border-radius: 20px;
+      margin-bottom: 28px;
+      background: #1e1e1e;
+      color: #888;
+    }
+    #status.connected { background: #0d2e1a; color: #4caf50; }
+    #status.error     { background: #2e0d0d; color: #f44336; }
+
+    #mic-btn {
+      width: 96px; height: 96px;
+      border-radius: 50%;
+      border: none;
+      cursor: pointer;
+      font-size: 2rem;
+      background: #1e1e1e;
+      color: #aaa;
+      transition: background 0.15s;
+      margin-bottom: 10px;
+    }
+    #mic-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    #mic-btn.active   { background: #c62828; color: #fff; animation: pulse 1.2s infinite; }
+    @keyframes pulse {
+      0%,100% { box-shadow: 0 0 0 0 rgba(198,40,40,0.5); }
+      50%      { box-shadow: 0 0 0 14px rgba(198,40,40,0); }
+    }
+    #mic-hint { font-size: 0.75rem; color: #555; margin-bottom: 8px; }
+
+    /* volume bar */
+    #vol-bar-wrap {
+      width: 160px; height: 4px; background: #1e1e1e;
+      border-radius: 2px; margin-bottom: 32px; overflow: hidden;
+    }
+    #vol-bar { height: 100%; width: 0; background: #4caf50; transition: width 0.05s; }
+
+    .transcript-area {
+      width: 100%; max-width: 680px;
+      display: flex; flex-direction: column; gap: 16px;
+    }
+    .bubble {
+      padding: 14px 18px;
+      border-radius: 14px;
+      font-size: 0.95rem;
+      line-height: 1.55;
+      max-width: 88%;
+      animation: fadeIn 0.2s ease;
+    }
+    @keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; } }
+    .bubble.user {
+      background: #1a2e3b; color: #90caf9;
+      align-self: flex-end; border-bottom-right-radius: 4px;
+    }
+    .bubble.ai {
+      background: #1e1e1e; color: #e0e0e0;
+      align-self: flex-start; border-bottom-left-radius: 4px;
+    }
+    .bubble .label {
+      font-size: 0.7rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.06em;
+      margin-bottom: 6px; opacity: 0.5;
+    }
+    #thinking {
+      display: none; align-self: flex-start;
+      padding: 12px 18px; background: #1e1e1e;
+      border-radius: 14px; border-bottom-left-radius: 4px;
+      color: #555; font-size: 0.9rem;
+    }
+    #thinking.visible { display: block; }
+  </style>
+</head>
+<body>
+
+<h1>Voice AI Platform</h1>
+<p class="subtitle">Real-time voice assistant — Whisper + OpenAI + Coqui TTS</p>
+
+<div id="status">Connecting…</div>
+
+<button id="mic-btn" disabled title="Click to speak">🎤</button>
+<p id="mic-hint">Waiting for connection…</p>
+<div id="vol-bar-wrap"><div id="vol-bar"></div></div>
+
+<div class="transcript-area" id="transcript">
+  <div id="thinking">…</div>
+</div>
+
+<script>
+  const TARGET_SR = 16000;  // backend expects 16 kHz int16 mono PCM
+  const SILENCE_FLUSH_MS = 900; // send silence after stop so VAD flushes utterance
+
+  const statusEl   = document.getElementById("status");
+  const micBtn     = document.getElementById("mic-btn");
+  const hintEl     = document.getElementById("mic-hint");
+  const transcriptEl = document.getElementById("transcript");
+  const thinkingEl = document.getElementById("thinking");
+  const volBar     = document.getElementById("vol-bar");
+
+  let ws;
+  // recording state: "idle" | "starting" | "recording" | "stopping"
+  let recState = "idle";
+  let audioCtx, mediaStream, processor, source;
+
+  /* ── WebSocket ─────────────────────────────────────────────────── */
+  function connect() {
+    const sessionId = crypto.randomUUID();
+    ws = new WebSocket(`ws://localhost:8000/ws/${sessionId}?token=dev-token`);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => {
+      statusEl.textContent = "Connected";
+      statusEl.className = "connected";
+      micBtn.disabled = false;
+      hintEl.textContent = "Click to start recording";
+    };
+    ws.onclose = () => {
+      statusEl.textContent = "Disconnected — reload to reconnect";
+      statusEl.className = "error";
+      micBtn.disabled = true;
+      hintEl.textContent = "";
+    };
+    ws.onerror = () => {
+      statusEl.textContent = "Connection error";
+      statusEl.className = "error";
+    };
+    ws.onmessage = (evt) => {
+      if (typeof evt.data === "string") {
+        handleText(JSON.parse(evt.data));
+      } else {
+        playWav(evt.data);
+      }
+    };
+  }
+
+  // Response text is buffered and shown only after the last audio chunk finishes,
+  // so the text and voice stay in sync.
+  let pendingResponseText = null;
+  let audioEndTimer = null;
+
+  function showPendingText() {
+    if (pendingResponseText) {
+      addBubble("ai", pendingResponseText);
+      pendingResponseText = null;
+    }
+  }
+
+  function handleText(msg) {
+    if (msg.type === "session_ready") {
+      addBubble("ai", "Session ready. Say something!");
+    } else if (msg.type === "transcript") {
+      thinkingEl.classList.remove("visible");
+      pendingResponseText = null;
+      clearTimeout(audioEndTimer);
+      addBubble("user", msg.text);
+      thinkingEl.classList.add("visible");
+    } else if (msg.type === "response") {
+      thinkingEl.classList.remove("visible");
+      pendingResponseText = msg.text;
+      // Fallback: show text after 15s in case audio never fires (e.g. TTS error)
+      clearTimeout(audioEndTimer);
+      audioEndTimer = setTimeout(showPendingText, 15000);
+    }
+  }
+
+  function addBubble(role, text) {
+    const div = document.createElement("div");
+    div.className = `bubble ${role}`;
+    const lbl = document.createElement("div");
+    lbl.className = "label";
+    lbl.textContent = role === "user" ? "You" : "AI";
+    div.appendChild(lbl);
+    div.appendChild(document.createTextNode(text));
+    transcriptEl.insertBefore(div, thinkingEl);
+    div.scrollIntoView({ behavior: "smooth" });
+  }
+
+  /* ── Audio playback ────────────────────────────────────────────── */
+  function playWav(arrayBuffer) {
+    const ctx = new AudioContext();
+    ctx.decodeAudioData(arrayBuffer.slice(0))
+      .then(decoded => {
+        const src = ctx.createBufferSource();
+        src.buffer = decoded;
+        src.connect(ctx.destination);
+        // When this chunk ends, wait 400ms — if no new chunk arrives, show the text
+        src.onended = () => {
+          clearTimeout(audioEndTimer);
+          audioEndTimer = setTimeout(showPendingText, 400);
+        };
+        src.start();
+      })
+      .catch(e => console.warn("WAV decode error:", e));
+  }
+
+  /* ── Downsample float32 from nativeSR → 16 kHz ────────────────── */
+  function downsampleTo16k(input, nativeSR) {
+    if (nativeSR === TARGET_SR) return input;
+    const ratio = nativeSR / TARGET_SR;
+    const outLen = Math.floor(input.length / ratio);
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const pos = i * ratio;
+      const lo = Math.floor(pos);
+      const hi = Math.min(lo + 1, input.length - 1);
+      out[i] = input[lo] + (pos - lo) * (input[hi] - input[lo]);
+    }
+    return out;
+  }
+
+  function float32ToInt16(input) {
+    const out = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+      const s = Math.max(-1, Math.min(1, input[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return out;
+  }
+
+  /* ── send a block of silence to flush VAD on the server ─────────── */
+  function sendSilence(durationMs) {
+    const samples = Math.floor(TARGET_SR * durationMs / 1000);
+    const silence = new Int16Array(samples); // all zeros
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(silence.buffer);
+    }
+  }
+
+  /* ── Recording start / stop ────────────────────────────────────── */
+  async function startRecording() {
+    // Use native sample rate — we'll downsample manually
+    audioCtx = new AudioContext();
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    source = audioCtx.createMediaStreamSource(mediaStream);
+
+    // Buffer size that gives ~100ms of audio at the native rate
+    const nativeSR = audioCtx.sampleRate;
+    const bufSize = 4096; // power-of-two, ~93ms @44100
+    processor = audioCtx.createScriptProcessor(bufSize, 1, 1);
+
+    processor.onaudioprocess = (e) => {
+      if (recState !== "recording" || !ws || ws.readyState !== WebSocket.OPEN) return;
+      const raw = e.inputBuffer.getChannelData(0);
+
+      // update volume bar
+      let rms = 0;
+      for (let i = 0; i < raw.length; i++) rms += raw[i] * raw[i];
+      rms = Math.sqrt(rms / raw.length);
+      volBar.style.width = Math.min(100, rms * 400) + "%";
+
+      const resampled = downsampleTo16k(raw, nativeSR);
+      const pcm = float32ToInt16(resampled);
+      ws.send(pcm.buffer);
+    };
+
+    // Connect processor to a muted gain node — ScriptProcessor requires a
+    // destination to fire onaudioprocess, but we must NOT route mic to speakers.
+    const silentGain = audioCtx.createGain();
+    silentGain.gain.value = 0;
+    source.connect(processor);
+    processor.connect(silentGain);
+    silentGain.connect(audioCtx.destination);
+    recState = "recording";
+  }
+
+  function stopRecording() {
+    recState = "stopping";
+    volBar.style.width = "0%";
+
+    // Send silence so the VAD backend detects end-of-speech and flushes the utterance
+    sendSilence(SILENCE_FLUSH_MS);
+
+    // Tear down mic after the silence has had time to be sent
+    setTimeout(() => {
+      if (processor) { processor.disconnect(); processor = null; }
+      if (source)    { source.disconnect();    source = null; }
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(t => t.stop());
+        mediaStream = null;
+      }
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
+      recState = "idle";
+    }, SILENCE_FLUSH_MS + 100);
+  }
+
+  /* ── Button handler ────────────────────────────────────────────── */
+  micBtn.addEventListener("click", async () => {
+    if (recState === "idle") {
+      // Update UI immediately, before async work
+      recState = "starting";
+      micBtn.disabled = true;
+      micBtn.classList.add("active");
+      micBtn.textContent = "⏹";
+      hintEl.textContent = "Starting mic…";
+
+      try {
+        await startRecording();
+        micBtn.disabled = false;
+        hintEl.textContent = "Recording — click to stop";
+      } catch (err) {
+        recState = "idle";
+        micBtn.classList.remove("active");
+        micBtn.textContent = "🎤";
+        micBtn.disabled = false;
+        hintEl.textContent = "Mic error: " + err.message;
+      }
+
+    } else if (recState === "recording") {
+      // Update UI immediately
+      micBtn.classList.remove("active");
+      micBtn.textContent = "🎤";
+      micBtn.disabled = true;
+      hintEl.textContent = "Processing…";
+      stopRecording();
+
+      // Re-enable after flush completes
+      setTimeout(() => {
+        micBtn.disabled = false;
+        hintEl.textContent = "Click to start recording";
+      }, SILENCE_FLUSH_MS + 200);
+    }
+    // ignore clicks during "starting" or "stopping"
+  });
+
+  connect();
+</script>
+</body>
+</html>

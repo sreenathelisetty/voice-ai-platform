@@ -1,0 +1,84 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ../backend
+      target: runtime
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql+asyncpg://voice:voice@postgres:5432/voiceai
+      - API_TOKEN=${API_TOKEN:-dev-token}
+      - LOG_FORMAT=console
+      - WHISPER_MODEL_SIZE=small.en
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - whisper_models:/app/models/whisper
+      - tts_models:/app/models/tts
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - redis_data:/data
+
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: voice
+      POSTGRES_PASSWORD: voice
+      POSTGRES_DB: voiceai
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voice -d voiceai"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@voiceai.local
+      PGADMIN_DEFAULT_PASSWORD: admin
+    depends_on:
+      - postgres
+    profiles:
+      - tools
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+    profiles:
+      - production
+
+volumes:
+  redis_data:
+  postgres_data:
+  whisper_models:
+  tts_models:
