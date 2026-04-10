@@ -8,6 +8,14 @@
 
 ---
 
+## Screenshots
+
+| Idle | Recording |
+|---|---|
+| ![Idle](docs/screenshot-idle.png) | ![Recording](docs/screenshot-recording.png) |
+
+---
+
 ## Architecture
 
 ```mermaid
